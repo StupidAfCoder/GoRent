@@ -16,6 +16,37 @@ import (
 	"github.com/jackpal/bencode-go"
 )
 
+type messageID uint8
+
+const (
+	MsgChoke         messageID = 0
+	MsgUnchoke       messageID = 1
+	MsgInterested    messageID = 2
+	MsgNotInterested messageID = 3
+	MsgHave          messageID = 4
+	MsgBitField      messageID = 5
+	MsgRequest       messageID = 6
+	MsgPiece         messageID = 7
+	MsgCancel        messageID = 8
+)
+
+type Message struct {
+	ID      messageID
+	Payload []byte
+}
+
+func (m *Message) Serialize() []byte {
+	if m == nil {
+		return make([]byte, 4)
+	}
+	length := uint32(len(m.Payload) + 1)
+	buffer := make([]byte, 4+length)
+	binary.BigEndian.PutUint32(buffer[0:4], length)
+	buffer[4] = byte(m.ID)
+	copy(buffer[5:], m.Payload)
+	return buffer
+}
+
 type bencodeInfo struct {
 	Pieces      string `bencode:"pieces"`
 	PieceLength int    `bencode:"piece length"`
@@ -42,6 +73,83 @@ type Peer struct {
 	port uint16
 }
 
+type Bitfield []byte
+
+func (bt Bitfield) CheckPiece(index int) bool {
+	byteIndex := index / 8
+	offset := index % 8
+	return bt[byteIndex]>>(7-offset)&1 != 0
+}
+
+func (bt Bitfield) SetPiece(index int) {
+	byteIndex := index / 8
+	offset := index / 8
+	bt[byteIndex] |= 1 << (7 - offset)
+}
+
+type Handshake struct {
+	Pstr     string
+	InfoHash [20]byte
+	PeerID   [20]byte
+}
+
+func (h *Handshake) Serialize() []byte {
+	buffer := make([]byte, len(h.Pstr)+49)
+	cursor := 1
+	buffer[0] = byte(len(h.Pstr))
+	cursor += copy(buffer[cursor:], h.Pstr)
+	cursor += copy(buffer[cursor:], make([]byte, 8))
+	cursor += copy(buffer[cursor:], h.InfoHash[:])
+	cursor += copy(buffer[cursor:], h.PeerID[:])
+	return buffer
+}
+
+func ReadHandShake(r io.Reader) (*Handshake, error) {
+	lengthBuffer := make([]byte, 1)
+	_, err := io.ReadFull(r, lengthBuffer)
+	if err != nil {
+		return nil, err
+	}
+	pstrlen := int(lengthBuffer[0])
+	handshakeBuffer := make([]byte, pstrlen+48)
+	_, err = io.ReadFull(r, handshakeBuffer)
+	if err != nil {
+		return nil, err
+	}
+	h := Handshake{}
+	h.Pstr = string(handshakeBuffer[0:pstrlen])
+	cursor := pstrlen
+	cursor += 8
+	copy(h.InfoHash[:], handshakeBuffer[cursor:cursor+20])
+	cursor += 20
+	copy(h.PeerID[:], handshakeBuffer[cursor:cursor+20])
+	return &h, nil
+}
+
+func ReadMessage(r io.Reader) (*Message, error) {
+	lengthBuffer := make([]byte, 4)
+	_, err := io.ReadFull(r, lengthBuffer)
+	if err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(lengthBuffer)
+
+	if length == 0 {
+		return nil, nil
+	}
+
+	messageBuffer := make([]byte, length)
+	_, err = io.ReadFull(r, messageBuffer)
+	if err != nil {
+		return nil, err
+	}
+	m := Message{
+		ID:      messageID(messageBuffer[0]),
+		Payload: messageBuffer[1:],
+	}
+	return &m, nil
+}
+
 func Unmarshal(peersBin []byte) ([]Peer, error) {
 	const peerSize = 6
 	numPeers := len(peersBin) / peerSize
@@ -60,7 +168,7 @@ func Unmarshal(peersBin []byte) ([]Peer, error) {
 
 func (i *bencodeInfo) toInfoHash() ([20]byte, error) {
 	var buffer bytes.Buffer
-	err := bencode.Marshal(&buffer, i)
+	err := bencode.Marshal(&buffer, *i)
 	if err != nil {
 		log.Fatal(err.Error())
 		return [20]byte{}, err
@@ -168,4 +276,5 @@ func main() {
 	}
 	torrentData, err := bencodeData.toTorrentFile()
 	fmt.Printf("Announce URL of the torrent --> %s \n", torrentData.Announce)
+
 }
