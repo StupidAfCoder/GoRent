@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/jackpal/bencode-go"
 )
@@ -45,6 +46,47 @@ func (m *Message) Serialize() []byte {
 	buffer[4] = byte(m.ID)
 	copy(buffer[5:], m.Payload)
 	return buffer
+}
+
+type pieceWork struct {
+	index  int
+	hash   [20]byte
+	length int
+}
+
+type pieceResult struct {
+	index int
+	buf   []byte
+}
+
+type Client struct {
+	Conn     net.Conn
+	Bitfield Bitfield
+	peer     Peer
+	peerID   [20]byte
+	infoHash [20]byte
+}
+
+func completeHandshake(conn net.Conn, peerid [20]byte, infohash [20]byte) (*Handshake, error) {
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	defer conn.SetDeadline(time.Time{})
+
+	request := New(infohash, peerid)
+	_, err := conn.Write(request.Serialize())
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := ReadHandShake(conn)
+	if err != nil {
+		return nil, err
+	}
+
+	if !bytes.Equal(response.InfoHash[:], infohash[:]) {
+		return nil, fmt.Errorf("expected infohash %x but got %x", response.InfoHash, infohash)
+	}
+
+	return response, nil
 }
 
 type bencodeInfo struct {
@@ -83,7 +125,7 @@ func (bt Bitfield) CheckPiece(index int) bool {
 
 func (bt Bitfield) SetPiece(index int) {
 	byteIndex := index / 8
-	offset := index / 8
+	offset := index % 8
 	bt[byteIndex] |= 1 << (7 - offset)
 }
 
@@ -91,6 +133,14 @@ type Handshake struct {
 	Pstr     string
 	InfoHash [20]byte
 	PeerID   [20]byte
+}
+
+func New(infohash, peerID [20]byte) *Handshake {
+	return &Handshake{
+		Pstr:     "BitTorrent protocol",
+		InfoHash: infohash,
+		PeerID:   peerID,
+	}
 }
 
 func (h *Handshake) Serialize() []byte {
@@ -182,7 +232,7 @@ func (i *bencodeInfo) toPieceHash() ([][20]byte, error) {
 	hashLen := 20
 
 	if len(data)%hashLen != 0 {
-		return nil, fmt.Errorf("Invalid Length Of Pieces %d", len(data))
+		return nil, fmt.Errorf("invalid length of pieces %d", len(data))
 	}
 
 	numHashes := len(data) / hashLen
@@ -252,7 +302,7 @@ func main() {
 	args := flag.Args()
 
 	if len(args) > 0 {
-		//User provided an file as argument
+		// User provided an file as argument
 		file, err := os.Open(args[0])
 		if err != nil {
 			log.Fatal("Could Not Parse File Check If it is a torrent")
@@ -260,7 +310,7 @@ func main() {
 		defer file.Close()
 		inputStream = file
 	} else {
-		//Checks If The User used to pipe an file!!
+		// Checks If The User used to pipe an file!!
 		stat, err := os.Stdin.Stat()
 		if (stat.Mode() & os.ModeCharDevice) != 0 {
 			log.Fatalf("There was an error while piping check if the output was through an human %s", err)
@@ -270,11 +320,12 @@ func main() {
 	}
 
 	bencodeData, err := Open(inputStream)
-
 	if err != nil {
 		panic(err)
 	}
 	torrentData, err := bencodeData.toTorrentFile()
+	if err != nil {
+		panic(err)
+	}
 	fmt.Printf("Announce URL of the torrent --> %s \n", torrentData.Announce)
-
 }
