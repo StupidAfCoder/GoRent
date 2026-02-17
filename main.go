@@ -61,6 +61,7 @@ type pieceResult struct {
 
 type Client struct {
 	Conn     net.Conn
+	Choked   bool
 	Bitfield Bitfield
 	peer     Peer
 	peerID   [20]byte
@@ -89,6 +90,50 @@ func completeHandshake(conn net.Conn, peerid [20]byte, infohash [20]byte) (*Hand
 	return response, nil
 }
 
+func recieveBitField(conn net.Conn) (Bitfield, error) {
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetDeadline(time.Time{})
+
+	message, err := ReadMessage(conn)
+	if err != nil {
+		return nil, err
+	}
+	if message.ID != MsgBitField {
+		err := fmt.Errorf("expected bitfield but got Id %d", message.ID)
+		return nil, err
+	}
+
+	return message.Payload, nil
+}
+
+func NewClient(peer Peer, peerid [20]byte, infohash [20]byte) (*Client, error) {
+	conn, err := net.DialTimeout("tcp", peer.String(), 3*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = completeHandshake(conn, peerid, infohash)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	bf, err := recieveBitField(conn)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	return &Client{
+		Conn:     conn,
+		Choked:   true,
+		Bitfield: bf,
+		peer:     peer,
+		peerID:   peerid,
+		infoHash: infohash,
+	}, nil
+}
+
 type bencodeInfo struct {
 	Pieces      string `bencode:"pieces"`
 	PieceLength int    `bencode:"piece length"`
@@ -113,6 +158,10 @@ type torrentFile struct {
 type Peer struct {
 	IP   net.IP
 	port uint16
+}
+
+func (p Peer) String() string {
+	return net.JoinHostPort(p.IP.String(), strconv.Itoa(int(p.port)))
 }
 
 type Bitfield []byte
