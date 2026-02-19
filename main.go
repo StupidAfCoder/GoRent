@@ -9,13 +9,21 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
 	"github.com/jackpal/bencode-go"
 )
+
+const BLOCKSIZE = 16384
+
+const MAXBACKLOG = 5
+
+const port = 6881
 
 type messageID uint8
 
@@ -34,6 +42,81 @@ const (
 type Message struct {
 	ID      messageID
 	Payload []byte
+}
+
+type trackerRespone struct {
+	Interval int    `bencode:"interval"`
+	Peers    string `bencode:"peers"`
+}
+
+func requestPeers(t *torrentFile, peerID [20]byte, port uint16) ([]Peer, error) {
+	urle, err := t.buildTrackerURL(peerID, port)
+	if err != nil {
+		return nil, err
+	}
+
+	annonounceURL, err := url.Parse(t.Announce)
+	if err != nil {
+		return nil, err
+	}
+
+	if annonounceURL.Scheme != "http" && annonounceURL.Scheme != "https" {
+		return nil, fmt.Errorf("The URL contains the UDP protocol which is not yet supported! The Protocol is %s", annonounceURL.Scheme)
+	}
+
+	resp, err := http.Get(urle)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	trackerResp := trackerRespone{}
+	err = bencode.Unmarshal(resp.Body, &trackerResp)
+	if err != nil {
+		return nil, err
+	}
+
+	return Unmarshal([]byte(trackerResp.Peers))
+}
+
+func generatePeerID() [20]byte {
+	var id [20]byte
+	copy(id[:], "-GO0001-123456789012")
+	return id
+}
+
+func parsePieceMessage(index int, buf []byte, msg *Message) (int, error) {
+	if msg.ID != MsgPiece {
+		return 0, fmt.Errorf("Expected PIECE message got %s", msg.ID)
+	}
+	if len(msg.Payload) < 8 {
+		return 0, fmt.Errorf("Expected Payload greater than 8 got %d", len(msg.Payload))
+	}
+	parsedIndex := int(binary.BigEndian.Uint32(msg.Payload[0:4]))
+	if parsedIndex != index {
+		return 0, fmt.Errorf("Got The Wrong Piece Here Expected %d", index)
+	}
+	begin := int(binary.BigEndian.Uint32(msg.Payload[4:8]))
+	if begin >= len(buf) {
+		return 0, fmt.Errorf("Begin is too HIGH")
+	}
+	data := msg.Payload[8:]
+	if len(data)+begin > len(buf) {
+		return 0, fmt.Errorf("Data is too long for the offset Begin %d %d", len(data), begin)
+	}
+	copy(buf[begin:], data)
+	return len(data), nil
+}
+
+func parseHaveMessage(msg *Message) (int, error) {
+	if msg.ID != MsgHave {
+		return 0, fmt.Errorf("Expected HAVE , got ID %d", msg.ID)
+	}
+	if len(msg.Payload) != 4 {
+		return 0, fmt.Errorf("Expected Length got %d", msg.Payload)
+	}
+	index := int(binary.BigEndian.Uint32(msg.Payload))
+	return index, nil
 }
 
 func (m *Message) Serialize() []byte {
@@ -59,6 +142,15 @@ type pieceResult struct {
 	buf   []byte
 }
 
+type pieceProgress struct {
+	index      int
+	client     Client
+	buffer     []byte
+	downloaded int
+	requested  int
+	backlog    int
+}
+
 type Client struct {
 	Conn     net.Conn
 	Choked   bool
@@ -66,6 +158,73 @@ type Client struct {
 	peer     Peer
 	peerID   [20]byte
 	infoHash [20]byte
+}
+
+func (c *Client) Read() (*Message, error) {
+	msg, err := ReadMessage(c.Conn)
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+func (c *Client) sendRequest(index, begin, length int) error {
+	req := formatRequest(index, begin, length)
+	_, err := c.Conn.Write(req.Serialize())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) sendInterested() error {
+	msg := Message{ID: MsgInterested}
+	_, err := c.Conn.Write(msg.Serialize())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) sendNotInterested() error {
+	msg := Message{ID: MsgNotInterested}
+	_, err := c.Conn.Write(msg.Serialize())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) sendUnchoke() error {
+	msg := Message{ID: MsgUnchoke}
+	_, err := c.Conn.Write(msg.Serialize())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Client) sendHave(index int) error {
+	msg := formatHave(index)
+	_, err := c.Conn.Write(msg.Serialize())
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func formatHave(index int) *Message {
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload, uint32(index))
+	return &Message{ID: MsgHave, Payload: payload}
+}
+
+func formatRequest(index, begin, length int) *Message {
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+	binary.BigEndian.PutUint32(payload[4:8], uint32(begin))
+	binary.BigEndian.PutUint32(payload[8:12], uint32(length))
+	return &Message{ID: MsgRequest, Payload: payload}
 }
 
 func completeHandshake(conn net.Conn, peerid [20]byte, infohash [20]byte) (*Handshake, error) {
@@ -134,6 +293,175 @@ func NewClient(peer Peer, peerid [20]byte, infohash [20]byte) (*Client, error) {
 	}, nil
 }
 
+func (state *pieceProgress) checkState() error {
+	msg, err := state.client.Read()
+	if err != nil {
+		return err
+	}
+	if msg == nil {
+		return nil
+	}
+	switch msg.ID {
+	case MsgUnchoke:
+		state.client.Choked = false
+	case MsgChoke:
+		state.client.Choked = true
+	case MsgHave:
+		index, err := parseHaveMessage(msg)
+		if err != nil {
+			return err
+		}
+		state.client.Bitfield.SetPiece(index)
+	case MsgPiece:
+		n, err := parsePieceMessage(state.index, state.buffer, msg)
+		if err != nil {
+			return err
+		}
+		state.downloaded += n
+		state.backlog--
+	}
+	return nil
+}
+
+type Torrent struct {
+	Peers       []Peer
+	PeerID      [20]byte
+	InfoHash    [20]byte
+	PieceHashes [][20]byte
+	PieceLength int
+	Length      int
+	Name        string
+}
+
+func attemptToDownloadPiece(client *Client, pieceW *pieceWork) ([]byte, error) {
+	state := pieceProgress{
+		index:  pieceW.index,
+		client: *client,
+		buffer: make([]byte, pieceW.length),
+	}
+
+	client.Conn.SetDeadline(time.Now().Add(100 * time.Second))
+	defer client.Conn.SetDeadline(time.Time{})
+
+	for state.downloaded < pieceW.length {
+		if !state.client.Choked {
+			for state.backlog < MAXBACKLOG && state.requested < pieceW.length {
+				blockSize := BLOCKSIZE
+				if pieceW.length-state.requested < blockSize {
+					blockSize = pieceW.length - state.requested
+				}
+
+				err := client.sendRequest(pieceW.index, state.requested, blockSize)
+				if err != nil {
+					return nil, err
+				}
+
+				state.backlog++
+				state.requested += blockSize
+			}
+		}
+
+		err := state.checkState()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return state.buffer, nil
+}
+
+func checkIntergrityForPiece(pieceW *pieceWork, buf []byte) error {
+	hash := sha1.Sum(buf)
+	if !bytes.Equal(hash[:], pieceW.hash[:]) {
+		return fmt.Errorf("The Hash Check Failed For This Piece", pieceW.index)
+	}
+	return nil
+}
+
+func (t *Torrent) startDownloadWorker(peer Peer, workQueue chan *pieceWork, results chan *pieceResult) {
+	client, err := NewClient(peer, t.PeerID, t.InfoHash)
+	if err != nil {
+		log.Printf("Could Not Hanshake with %s", peer.IP)
+		return
+	}
+	defer client.Conn.Close()
+	log.Println("Completed Handshake With IP")
+
+	client.sendUnchoke()
+	client.sendInterested()
+
+	for pieceW := range workQueue {
+		if !client.Bitfield.CheckPiece(pieceW.index) {
+			workQueue <- pieceW
+			continue
+		}
+
+		buf, err := attemptToDownloadPiece(client, pieceW)
+		if err != nil {
+			log.Println("Exit", err)
+			workQueue <- pieceW
+			continue
+		}
+
+		err = checkIntergrityForPiece(pieceW, buf)
+		if err != nil {
+			log.Println(err)
+			workQueue <- pieceW
+			continue
+		}
+
+		err = client.sendHave(pieceW.index)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		results <- &pieceResult{pieceW.index, buf}
+	}
+}
+
+func (t *Torrent) calculateBoundsForPiece(index int) (begin int, end int) {
+	begin = index * t.PieceLength
+	end = begin + t.PieceLength
+	if end > t.Length {
+		end = t.Length
+	}
+	return begin, end
+}
+
+func (t *Torrent) calculateLengthForPiece(index int) int {
+	begin, end := t.calculateBoundsForPiece(index)
+	return end - begin
+}
+
+func (t *Torrent) Download() ([]byte, error) {
+	log.Println("Starting Download For", t.Name)
+	workQueue := make(chan *pieceWork, len(t.PieceHashes))
+	result := make(chan *pieceResult)
+	for index, hash := range t.PieceHashes {
+		length := t.calculateLengthForPiece(index)
+		workQueue <- &pieceWork{index, hash, length}
+	}
+
+	for _, peer := range t.Peers {
+		go t.startDownloadWorker(peer, workQueue, result)
+	}
+
+	bud := make([]byte, t.Length)
+	donePieces := 0
+	for donePieces < len(t.PieceHashes) {
+		res := <-result
+		begin, end := t.calculateBoundsForPiece(res.index)
+		copy(bud[begin:end], res.buf)
+		donePieces++
+
+		percent := float64(donePieces) / float64(len(t.PieceHashes)) * 100
+		numWorkers := runtime.NumGoroutine() - 1
+		fmt.Printf("(%.2f%%) Downloaded Piece %d from %d peers\n", percent, res.index, numWorkers)
+	}
+	close(workQueue)
+	return bud, nil
+}
+
 type bencodeInfo struct {
 	Pieces      string `bencode:"pieces"`
 	PieceLength int    `bencode:"piece length"`
@@ -153,6 +481,18 @@ type torrentFile struct {
 	PieceLength int
 	Length      int
 	Name        string
+}
+
+func (tf *torrentFile) toTorrent(peers []Peer, peerID [20]byte) *Torrent {
+	return &Torrent{
+		Peers:       peers,
+		PeerID:      peerID,
+		InfoHash:    tf.InfoHash,
+		PieceHashes: tf.PieceHashes,
+		PieceLength: tf.PieceLength,
+		Length:      tf.Length,
+		Name:        tf.Name,
+	}
 }
 
 type Peer struct {
@@ -326,22 +666,34 @@ func Open(r io.Reader) (*bencodeTorrent, error) {
 	return &bto, nil
 }
 
-func (t *torrentFile) buildTrackerURL(peerID [20]byte, port uint16) (string, error) {
-	base, err := url.Parse(t.Announce)
+func percentEncode(b []byte) string {
+	res := ""
+	for _, v := range b {
+		res += fmt.Sprintf("%%%02X", v)
+	}
+	return res
+}
+
+func (tf *torrentFile) buildTrackerURL(peerID [20]byte, port uint16) (string, error) {
+	base, err := url.Parse(tf.Announce)
 	if err != nil {
 		return "", err
 	}
 	params := url.Values{
-		"info_hash":  []string{string(t.InfoHash[:])},
-		"peer_id":    []string{string(peerID[:])},
 		"port":       []string{strconv.Itoa(int(port))},
 		"uploaded":   []string{"0"},
 		"downloaded": []string{"0"},
 		"compact":    []string{"1"},
-		"left":       []string{strconv.Itoa(t.Length)},
+		"left":       []string{strconv.Itoa(tf.Length)},
 	}
 	base.RawQuery = params.Encode()
+	base.RawQuery += "&info_hash=" + percentEncode(tf.InfoHash[:])
+	base.RawQuery += "&peer_id=" + percentEncode(peerID[:])
 	return base.String(), nil
+}
+
+func saveToOs(name string, data []byte) error {
+	return os.WriteFile(name, data, 0o644)
 }
 
 func main() {
@@ -376,5 +728,25 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("Announce URL of the torrent --> %s \n", torrentData.Announce)
+
+	peerID := generatePeerID()
+	peers, err := requestPeers(&torrentData, peerID, port)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Printf("Number Of Peers %d", len(peers))
+	torrent := torrentData.toTorrent(peers, peerID)
+
+	data, err := torrent.Download()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = saveToOs(torrent.Name, data)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("The Torrent Has Been Saved To Your Computer --> ", torrent.Name)
 }
