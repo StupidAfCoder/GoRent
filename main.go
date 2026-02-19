@@ -379,43 +379,40 @@ func checkIntergrityForPiece(pieceW *pieceWork, buf []byte) error {
 }
 
 func (t *Torrent) startDownloadWorker(peer Peer, workQueue chan *pieceWork, results chan *pieceResult) {
-	client, err := NewClient(peer, t.PeerID, t.InfoHash)
-	if err != nil {
-		log.Printf("Could Not Hanshake with %s", peer.IP)
-		return
-	}
-	defer client.Conn.Close()
-	log.Println("Completed Handshake With IP")
-
-	client.sendUnchoke()
-	client.sendInterested()
-
-	for pieceW := range workQueue {
-		if !client.Bitfield.CheckPiece(pieceW.index) {
-			workQueue <- pieceW
-			continue
-		}
-
-		buf, err := attemptToDownloadPiece(client, pieceW)
+	for {
+		client, err := NewClient(peer, t.PeerID, t.InfoHash)
 		if err != nil {
-			log.Println("Exit", err)
-			workQueue <- pieceW
-			continue
+			log.Printf("Could Not Hanshake with %s", peer.IP)
+			return
 		}
 
-		err = checkIntergrityForPiece(pieceW, buf)
-		if err != nil {
-			log.Println(err)
-			workQueue <- pieceW
-			continue
-		}
+		client.sendUnchoke()
+		client.sendInterested()
 
-		err = client.sendHave(pieceW.index)
-		if err != nil {
-			log.Println(err)
-			continue
+		for pieceW := range workQueue {
+			if !client.Bitfield.CheckPiece(pieceW.index) {
+				workQueue <- pieceW
+				continue
+			}
+
+			buf, err := attemptToDownloadPiece(client, pieceW)
+			if err != nil {
+				log.Println("Peer Disconnected ", err)
+				client.Conn.Close()
+				workQueue <- pieceW
+				break
+			}
+
+			err = checkIntergrityForPiece(pieceW, buf)
+			if err != nil {
+				log.Println(err)
+				workQueue <- pieceW
+				continue
+			}
+
+			client.sendHave(pieceW.index)
+			results <- &pieceResult{pieceW.index, buf}
 		}
-		results <- &pieceResult{pieceW.index, buf}
 	}
 }
 
