@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"runtime"
 	"strconv"
 	"time"
@@ -22,6 +23,16 @@ import (
 const BLOCKSIZE = 16384
 
 const MAXBACKLOG = 100
+
+var debugLog = log.New(io.Discard, "", 0)
+
+func SetVerbose(v bool) {
+	if v {
+		debugLog = log.New(os.Stderr, "", log.LstdFlags)
+	} else {
+		debugLog = log.New(io.Discard, "", 0)
+	}
+}
 
 type trackerRespone struct {
 	Interval int    `bencode:"interval"`
@@ -208,7 +219,7 @@ func (t *Torrent) startDownloadWorker(p peer.Peer, workQueue chan *pieceWork, re
 	for {
 		client, err := peer.NewClient(p, t.PeerID, t.InfoHash)
 		if err != nil {
-			log.Printf("Could Not Hanshake with %s", p.IP)
+			debugLog.Printf("Could Not Hanshake with %s", p.IP)
 			time.Sleep(backoff)
 			if backoff < 30*time.Second {
 				backoff *= 2
@@ -228,7 +239,7 @@ func (t *Torrent) startDownloadWorker(p peer.Peer, workQueue chan *pieceWork, re
 
 			buf, err := attemptToDownloadPiece(client, pieceW)
 			if err != nil {
-				log.Println("Peer Disconnected ", err)
+				debugLog.Println("Peer Disconnected ", err)
 				client.Conn.Close()
 				workQueue <- pieceW
 				break

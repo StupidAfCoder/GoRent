@@ -17,6 +17,10 @@ func saveToOs(name string, data []byte) error {
 }
 
 func main() {
+	verbose := flag.Bool("v", false, "Show Verbose Peer Debug Output!")
+	flag.Parse()
+
+	torrent.SetVerbose(*verbose)
 	var inputStream io.Reader
 
 	flag.Parse()
@@ -55,7 +59,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Number Of Peers %d", len(peers))
+	fmt.Printf("Number Of Peers %d\n", len(peers))
 	t := torrentData.ToTorrent(peers, peerID)
 
 	data, err := t.Download()
