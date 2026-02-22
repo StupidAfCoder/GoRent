@@ -21,7 +21,7 @@ import (
 
 const BLOCKSIZE = 16384
 
-const MAXBACKLOG = 5
+const MAXBACKLOG = 100
 
 const port = 6881
 
@@ -87,7 +87,7 @@ func generatePeerID() [20]byte {
 
 func parsePieceMessage(index int, buf []byte, msg *Message) (int, error) {
 	if msg.ID != MsgPiece {
-		return 0, fmt.Errorf("Expected PIECE message got %s", msg.ID)
+		return 0, fmt.Errorf("Expected PIECE message got %x", msg.ID)
 	}
 	if len(msg.Payload) < 8 {
 		return 0, fmt.Errorf("Expected Payload greater than 8 got %d", len(msg.Payload))
@@ -144,7 +144,7 @@ type pieceResult struct {
 
 type pieceProgress struct {
 	index      int
-	client     Client
+	client     *Client
 	buffer     []byte
 	downloaded int
 	requested  int
@@ -336,11 +336,11 @@ type Torrent struct {
 func attemptToDownloadPiece(client *Client, pieceW *pieceWork) ([]byte, error) {
 	state := pieceProgress{
 		index:  pieceW.index,
-		client: *client,
+		client: client,
 		buffer: make([]byte, pieceW.length),
 	}
 
-	client.Conn.SetDeadline(time.Now().Add(100 * time.Second))
+	client.Conn.SetDeadline(time.Now().Add(30 * time.Second))
 	defer client.Conn.SetDeadline(time.Time{})
 
 	for state.downloaded < pieceW.length {
@@ -373,18 +373,24 @@ func attemptToDownloadPiece(client *Client, pieceW *pieceWork) ([]byte, error) {
 func checkIntergrityForPiece(pieceW *pieceWork, buf []byte) error {
 	hash := sha1.Sum(buf)
 	if !bytes.Equal(hash[:], pieceW.hash[:]) {
-		return fmt.Errorf("The Hash Check Failed For This Piece", pieceW.index)
+		return fmt.Errorf("The Hash Check Failed For This Piece %d", pieceW.index)
 	}
 	return nil
 }
 
 func (t *Torrent) startDownloadWorker(peer Peer, workQueue chan *pieceWork, results chan *pieceResult) {
+	backoff := time.Second
 	for {
 		client, err := NewClient(peer, t.PeerID, t.InfoHash)
 		if err != nil {
 			log.Printf("Could Not Hanshake with %s", peer.IP)
-			return
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
 		}
+		backoff = time.Second
 
 		client.sendUnchoke()
 		client.sendInterested()
