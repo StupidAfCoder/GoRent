@@ -60,7 +60,7 @@ GoRent/
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/your-username/GoRent.git
+git clone https://github.com/StupidAfCoder/GoRent.git
 cd GoRent
 go mod tidy
 ```
