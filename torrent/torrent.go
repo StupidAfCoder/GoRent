@@ -29,9 +29,9 @@ var debugLog = log.New(io.Discard, "", 0)
 func SetVerbose(v bool) {
 	if v {
 		debugLog = log.New(os.Stderr, "", log.LstdFlags)
+	} else {
+		debugLog = log.New(io.Discard, "", 0)
 	}
-
-	debugLog = log.New(io.Discard, "", 0)
 }
 
 type trackerRespone struct {

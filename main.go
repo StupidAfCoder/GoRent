@@ -23,7 +23,6 @@ func main() {
 	torrent.SetVerbose(*verbose)
 	var inputStream io.Reader
 
-	flag.Parse()
 	args := flag.Args()
 
 	if len(args) > 0 {
